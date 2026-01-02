@@ -3,8 +3,35 @@ import { Config } from '..'
 
 export function apply(ctx: Context, config: Config) {
     ctx.on('chatluna/before-check-sender', async (session) => {
-        const guildId = session.guildId
-        if (!config.applyGroup.includes(guildId) || session.isDirect) {
+        const directKey = `direct:${session.userId}`
+        const guildId = session.guildId || session.channelId || directKey
+        if (!session.guildId) session.guildId = guildId
+
+        const candidates = [
+            guildId,
+            directKey,
+            session.platform,
+            session.gid,
+            session.cid,
+            session.uid
+        ].filter(Boolean) as string[]
+
+        const hasSandboxRule = (config.applyGroup ?? []).some((value) =>
+            value?.startsWith('sandbox:')
+        )
+        const isSandbox = session.platform?.startsWith('sandbox:')
+
+        const matched =
+            (config.applyGroup ?? []).some((value) => {
+                if (candidates.includes(value)) return true
+                if (!value.includes(':')) return false
+                const prefix = `${value}:`
+                return candidates.some((candidate) =>
+                    candidate.startsWith(prefix)
+                )
+            }) || (isSandbox && hasSandboxRule)
+
+        if (!matched) {
             return false
         }
 

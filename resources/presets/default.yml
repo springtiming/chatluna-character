@@ -2,6 +2,7 @@ name: 煕
 
 nick_name:
     - 煕
+    - 熙
 
 input: |
     当前时间：{time}

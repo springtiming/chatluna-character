@@ -11,10 +11,12 @@ export function apply(ctx: Context, config: Config) {
 
     ctx.plugin(
         {
-            apply: (ctx: Context, config: Config) => {
+            apply: async (ctx: Context, config: Config) => {
+                // 立即加载预设以注册动态 Schema
+                await ctx.chatluna_character.preset.init()
+                
                 ctx.on('ready', async () => {
                     await ctx.chatluna_character.stickerService.init()
-                    await ctx.chatluna_character.preset.init()
                     await plugins(ctx, config)
                 })
             },
@@ -28,7 +30,7 @@ export function apply(ctx: Context, config: Config) {
         config
     )
 
-    ctx.middleware((session, next) => {
+    ctx.middleware(async (session, next) => {
         if (!ctx.chatluna_character) {
             return next()
         }
@@ -38,18 +40,44 @@ export function apply(ctx: Context, config: Config) {
             return next()
         }
 
-        const guildId = session.guildId
+        // Allow sandbox/direct chat to test character preset.
+        const directKey = `direct:${session.userId}`
+        const guildId = session.guildId || session.channelId || directKey
+        if (!session.guildId) {
+            ;(session as unknown as { guildId: string }).guildId = guildId
+        }
 
-        if (!config.applyGroup.includes(guildId)) {
+        const candidates = [
+            guildId,
+            directKey,
+            session.platform,
+            session.gid,
+            session.cid,
+            session.uid
+        ].filter(Boolean) as string[]
+
+        const hasSandboxRule = (config.applyGroup ?? []).some((value) =>
+            value?.startsWith('sandbox:')
+        )
+        const isSandbox = session.platform?.startsWith('sandbox:')
+
+        const matched =
+            (config.applyGroup ?? []).some((value) => {
+                if (candidates.includes(value)) return true
+                if (!value.includes(':')) return false
+                const prefix = `${value}:`
+                return candidates.some((candidate) =>
+                    candidate.startsWith(prefix)
+                )
+            }) || (isSandbox && hasSandboxRule)
+
+        if (!matched) {
             return next()
         }
 
-        return next(async (loop) => {
-            if (!(await ctx.chatluna_character.broadcast(session))) {
-                return loop()
-            }
-        })
-    })
+        const handled = await ctx.chatluna_character.broadcast(session)
+        if (!handled) return next()
+    }, true)
 }
 
 export const inject = {
