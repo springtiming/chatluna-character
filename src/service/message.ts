@@ -3,7 +3,13 @@ import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { createLogger } from 'koishi-plugin-chatluna/utils/logger'
 import { Config } from '..'
 import { Preset } from '../preset'
-import { GroupTemp, Message } from '../types'
+import {
+    GroupLock,
+    GroupTemp,
+    Message,
+    MessageCollectorFilter,
+    MessageImage
+} from '../types'
 import { StickerService } from './sticker'
 import {
     hashString,
@@ -18,6 +24,14 @@ export class MessageCollector extends Service {
     private _groupLocks: Record<string, GroupLock> = {}
 
     private _groupTemp: Record<string, GroupTemp> = {}
+
+    private _responseWaiters: Record<
+        string,
+        {
+            resolve: () => void
+            reject: (reason?: string) => void
+        }[]
+    > = {}
 
     stickerService: StickerService
 
@@ -51,8 +65,24 @@ export class MessageCollector extends Service {
     }
 
     muteAtLeast(session: Session, time: number) {
-        const lock = this._getGroupLocks(session.guildId)
-        lock.mute = Math.max(lock.mute ?? 0, Date.now() + time)
+        const groupId = session.guildId
+        const groupLock = this._getGroupLocks(groupId)
+
+        const interval = setInterval(() => {
+            if (!groupLock.lock) {
+                groupLock.lock = true
+                clearInterval(interval)
+
+                try {
+                    groupLock.mute = Math.max(
+                        groupLock.mute ?? 0,
+                        Date.now() + time
+                    )
+                } finally {
+                    groupLock.lock = false
+                }
+            }
+        }, 100)
     }
 
     collect(func: (session: Session, messages: Message[]) => Promise<void>) {
@@ -74,27 +104,69 @@ export class MessageCollector extends Service {
         return lock.responseLock
     }
 
+    /**
+     * Try to acquire the response lock. If the lock is already held, wait until it is released.
+     * @returns A Promise that resolves to whether the lock was successfully acquired (false means cancelled)
+     */
+    async acquireResponseLock(
+        session: Session,
+        message: Message
+    ): Promise<boolean> {
+        const groupId = session.guildId
+        const lock = this._getGroupLocks(groupId)
+
+        if (!lock.responseLock) {
+            lock.responseLock = true
+            return true
+        }
+
+        // Lock is held, wait for release
+        return new Promise<boolean>((resolve) => {
+            if (!this._responseWaiters[groupId]) {
+                this._responseWaiters[groupId] = []
+            }
+            this._responseWaiters[groupId].push({
+                resolve: () => resolve(true),
+                reject: () => resolve(false)
+            })
+        })
+    }
+
     setResponseLock(session: Session) {
         const lock = this._getGroupLocks(session.guildId)
         lock.responseLock = true
     }
 
     releaseResponseLock(session: Session) {
-        const lock = this._getGroupLocks(session.guildId)
-        lock.responseLock = false
-        lock.pendingTrigger = undefined
-    }
-
-    setPendingTrigger(session: Session, message: Message) {
-        const lock = this._getGroupLocks(session.guildId)
-        lock.pendingTrigger = { session, message, timestamp: Date.now() }
-    }
-
-    takePendingTrigger(groupId: string) {
+        const groupId = session.guildId
         const lock = this._getGroupLocks(groupId)
-        const pendingTrigger = lock.pendingTrigger
-        lock.pendingTrigger = undefined
-        return pendingTrigger
+
+        lock.responseLock = false
+
+        const waiters = this._responseWaiters[groupId]
+        if (waiters && waiters.length > 0) {
+            // Cancel all old waiters, only wake up the latest one
+            const latestWaiter = waiters.pop()
+            for (const waiter of waiters) {
+                waiter.reject()
+            }
+            this._responseWaiters[groupId] = []
+
+            if (latestWaiter) {
+                lock.responseLock = true
+                latestWaiter.resolve()
+            }
+        }
+    }
+
+    cancelPendingWaiters(groupId: string) {
+        const waiters = this._responseWaiters[groupId]
+        if (waiters) {
+            for (const waiter of waiters) {
+                waiter.reject('cancelled')
+            }
+            this._responseWaiters[groupId] = []
+        }
     }
 
     async updateTemp(session: Session, temp: GroupTemp) {
@@ -168,22 +240,57 @@ export class MessageCollector extends Service {
         })
     }
 
-    clear(groupId?: string) {
+    private _lockByGroupId(groupId: string) {
+        const groupLock = this._getGroupLocks(groupId)
+        return new Promise<void>((resolve) => {
+            const interval = setInterval(() => {
+                if (!groupLock.lock) {
+                    groupLock.lock = true
+                    clearInterval(interval)
+                    resolve()
+                }
+            }, 100)
+        })
+    }
+
+    private _unlockByGroupId(groupId: string) {
+        const groupLock = this._getGroupLocks(groupId)
+        groupLock.lock = false
+    }
+
+    async clear(groupId?: string) {
         if (groupId) {
-            this._messages[groupId] = []
-            this._groupTemp[groupId] = {
-                completionMessages: []
+            await this._lockByGroupId(groupId)
+            try {
+                this._messages[groupId] = []
+                this._groupTemp[groupId] = {
+                    completionMessages: []
+                }
+                this.cancelPendingWaiters(groupId)
+            } finally {
+                this._unlockByGroupId(groupId)
             }
-            const lock = this._groupLocks[groupId]
-            if (lock) lock.pendingTrigger = undefined
             return
         }
 
-        this._messages = {}
-        this._groupTemp = {}
+        // For clear-all, acquire locks in sorted order to prevent deadlocks
+        const groupIds = Object.keys(this._groupLocks).sort()
+        for (const gid of groupIds) {
+            await this._lockByGroupId(gid)
+        }
 
-        for (const lock of Object.values(this._groupLocks)) {
-            lock.pendingTrigger = undefined
+        try {
+            this._messages = {}
+            this._groupTemp = {}
+
+            for (const gid of groupIds) {
+                this.cancelPendingWaiters(gid)
+            }
+        } finally {
+            // Release in reverse order
+            for (let i = groupIds.length - 1; i >= 0; i--) {
+                this._unlockByGroupId(groupIds[i])
+            }
         }
     }
 
@@ -192,18 +299,9 @@ export class MessageCollector extends Service {
             return
         }
 
-        await this._lock(session)
-
-        const groupId = session.guildId
-        const maxMessageSize = this._config.maxMessages
-        const groupArray = this._messages[groupId]
-            ? this._messages[groupId]
-            : []
-
         const content = mapElementToString(session, session.content, elements)
 
         if (content.length < 1) {
-            await this._unlock(session)
             return
         }
 
@@ -215,15 +313,7 @@ export class MessageCollector extends Service {
             timestamp: session.event.timestamp
         }
 
-        groupArray.push(message)
-
-        while (groupArray.length > maxMessageSize) {
-            groupArray.shift()
-        }
-
-        this._messages[groupId] = groupArray
-
-        await this._unlock(session)
+        await this._addMessage(session, message)
     }
 
     async broadcast(session: Session) {
@@ -231,12 +321,7 @@ export class MessageCollector extends Service {
             return
         }
 
-        await this._lock(session)
-
         const groupId = session.guildId
-        const maxMessageSize = this._config.maxMessages
-        let groupArray = this._messages[groupId] ? this._messages[groupId] : []
-
         const config = this._getGroupConfig(groupId)
 
         const images = config.image
@@ -255,7 +340,6 @@ export class MessageCollector extends Service {
         )
 
         if (content.length < 1) {
-            await this._unlock(session)
             return
         }
 
@@ -281,49 +365,74 @@ export class MessageCollector extends Service {
                       ),
                       name: session.quote?.user?.name,
                       id: session.quote?.user?.id,
-                      // `session.quote.id` is the quoted message id in Koishi.
-                      messageId: (session.quote as { id?: string } | undefined)
-                          ?.id
+                      messageId: session.quote.id
                   }
                 : undefined,
             images
         }
 
-        groupArray.push(message)
-
-        while (groupArray.length > maxMessageSize) {
-            groupArray.shift()
-        }
-
-        const now = Date.now()
-        groupArray = groupArray.filter((message) => {
-            return (
-                message.timestamp == null ||
-                message.timestamp >= now - Time.hour
-            )
+        const shouldTrigger = await this._addMessage(session, message, {
+            filterExpiredMessages: true,
+            processImages: config
         })
 
-        await this._processImages(groupArray, config)
-
-        this._messages[groupId] = groupArray
-
-        if (
-            this._filters.some((func) => func(session, message)) &&
-            !this.isMute(session)
-        ) {
-            this.setResponseLock(session)
-            this.ctx
-                .parallel(
-                    'chatluna_character/message_collect',
-                    session,
-                    groupArray
-                )
-                .catch((error) => this.logger.error(error))
-            await this._unlock(session)
+        if (shouldTrigger && !this.isMute(session)) {
+            const acquired = await this.acquireResponseLock(session, message)
+            if (!acquired) {
+                // Cancelled, do not trigger
+                return false
+            }
+            await this.ctx.parallel(
+                'chatluna_character/message_collect',
+                session,
+                this._messages[groupId]
+            )
             return true
         } else {
-            await this._unlock(session)
             return this.isMute(session)
+        }
+    }
+
+    private async _addMessage(
+        session: Session,
+        message: Message,
+        options?: {
+            filterExpiredMessages?: boolean
+            processImages?: Config
+        }
+    ): Promise<boolean> {
+        await this._lock(session)
+
+        try {
+            const groupId = session.guildId
+            const maxMessageSize = this._config.maxMessages
+            let groupArray = this._messages[groupId] ?? []
+
+            groupArray.push(message)
+
+            while (groupArray.length > maxMessageSize) {
+                groupArray.shift()
+            }
+
+            if (options?.filterExpiredMessages) {
+                const now = Date.now()
+                groupArray = groupArray.filter((msg) => {
+                    return (
+                        msg.timestamp == null ||
+                        msg.timestamp >= now - Time.hour
+                    )
+                })
+            }
+
+            if (options?.processImages) {
+                await this._processImages(groupArray, options.processImages)
+            }
+
+            this._messages[groupId] = groupArray
+
+            return this._filters.some((func) => func(session, message))
+        } finally {
+            await this._unlock(session)
         }
     }
 
@@ -392,12 +501,6 @@ export class MessageCollector extends Service {
             return 0
         }
     }
-}
-
-type MessageImage = {
-    url: string
-    hash: string
-    formatted: string
 }
 
 function mapElementToString(
@@ -518,19 +621,12 @@ async function getImages(ctx: Context, model: string, session: Session) {
     return results
 }
 
-type MessageCollectorFilter = (session: Session, message: Message) => boolean
-
-interface GroupLock {
-    lock: boolean
-    mute: number
-    responseLock: boolean
-    pendingTrigger?: PendingTrigger
-}
-
-interface PendingTrigger {
-    session: Session
-    message: Message
-    timestamp: number
+export function getNotEmptyString(...texts: (string | undefined)[]): string {
+    for (const text of texts) {
+        if (text && text?.length > 0) {
+            return text
+        }
+    }
 }
 
 declare module 'koishi' {
@@ -542,13 +638,5 @@ declare module 'koishi' {
             session: Session,
             message: Message[]
         ) => void | Promise<void>
-    }
-}
-
-export function getNotEmptyString(...texts: (string | undefined)[]): string {
-    for (const text of texts) {
-        if (text && text?.length > 0) {
-            return text
-        }
     }
 }
