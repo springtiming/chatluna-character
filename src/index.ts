@@ -11,12 +11,9 @@ export function apply(ctx: Context, config: Config) {
 
     ctx.plugin(
         {
-            apply: async (ctx: Context, config: Config) => {
-                // 立即加载预设以注册动态 Schema
-                await ctx.chatluna_character.preset.init()
-                
+            apply: (ctx: Context, config: Config) => {
                 ctx.on('ready', async () => {
-                    await ctx.chatluna_character.stickerService.init()
+                    await ctx.chatluna_character.preset.init()
                     await plugins(ctx, config)
                 })
             },
@@ -30,7 +27,7 @@ export function apply(ctx: Context, config: Config) {
         config
     )
 
-    ctx.middleware(async (session, next) => {
+    ctx.middleware((session, next) => {
         if (!ctx.chatluna_character) {
             return next()
         }
@@ -40,44 +37,18 @@ export function apply(ctx: Context, config: Config) {
             return next()
         }
 
-        // Allow sandbox/direct chat to test character preset.
-        const directKey = `direct:${session.userId}`
-        const guildId = session.guildId || session.channelId || directKey
-        if (!session.guildId) {
-            ;(session as unknown as { guildId: string }).guildId = guildId
-        }
+        const guildId = session.guildId
 
-        const candidates = [
-            guildId,
-            directKey,
-            session.platform,
-            session.gid,
-            session.cid,
-            session.uid
-        ].filter(Boolean) as string[]
-
-        const hasSandboxRule = (config.applyGroup ?? []).some((value) =>
-            value?.startsWith('sandbox:')
-        )
-        const isSandbox = session.platform?.startsWith('sandbox:')
-
-        const matched =
-            (config.applyGroup ?? []).some((value) => {
-                if (candidates.includes(value)) return true
-                if (!value.includes(':')) return false
-                const prefix = `${value}:`
-                return candidates.some((candidate) =>
-                    candidate.startsWith(prefix)
-                )
-            }) || (isSandbox && hasSandboxRule)
-
-        if (!matched) {
+        if (!config.applyGroup.includes(guildId)) {
             return next()
         }
 
-        const handled = await ctx.chatluna_character.broadcast(session)
-        if (!handled) return next()
-    }, true)
+        return next(async (loop) => {
+            if (!(await ctx.chatluna_character.broadcast(session))) {
+                return loop()
+            }
+        })
+    })
 }
 
 export const inject = {
@@ -289,14 +260,6 @@ export const Config = Schema.intersect([
             .max(6)
             .description('模型历史消息轮数，为 0 不发送之前的历史轮次'),
 
-        sendStickerProbability: Schema.number()
-            .default(0.0)
-            .min(0)
-            .max(1)
-            .role('slider')
-            .step(0.01)
-            .hidden()
-            .description('发送表情的概率（即将废弃，将制作新的表情系统插件）'),
         defaultPreset: Schema.dynamic('character-preset')
             .description('使用的伪装预设')
             .default('煕')
@@ -422,14 +385,6 @@ export const Config = Schema.intersect([
                     .min(0)
                     .max(6)
                     .description('模型历史消息轮数，为 0 不发送之前的历史轮次'),
-
-                sendStickerProbability: Schema.number()
-                    .default(0)
-                    .min(0)
-                    .max(1)
-                    .role('slider')
-                    .step(0.01)
-                    .description('发送表情的概率'),
                 preset: Schema.dynamic('character-preset')
                     .description('使用的伪装预设')
                     .default('煕')

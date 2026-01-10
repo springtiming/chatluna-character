@@ -10,7 +10,7 @@ import {
     MessageCollectorFilter,
     MessageImage
 } from '../types'
-import { StickerService } from './sticker'
+
 import {
     hashString,
     isMessageContentImageUrl
@@ -33,8 +33,6 @@ export class MessageCollector extends Service {
         }[]
     > = {}
 
-    stickerService: StickerService
-
     preset: Preset
 
     declare logger: Logger
@@ -44,7 +42,6 @@ export class MessageCollector extends Service {
         public _config: Config
     ) {
         super(ctx, 'chatluna_character')
-        this.stickerService = new StickerService(ctx, _config)
         this.logger = createLogger(ctx, 'chatluna-character')
         this.preset = new Preset(ctx)
     }
@@ -56,7 +53,10 @@ export class MessageCollector extends Service {
     mute(session: Session, time: number) {
         const lock = this._getGroupLocks(session.guildId)
         let mute = lock.mute ?? 0
-        if (mute < new Date().getTime()) {
+
+        if (time === 0) {
+            mute = 0
+        } else if (mute < new Date().getTime()) {
             mute = new Date().getTime() + time
         } else {
             mute = mute + time
@@ -567,7 +567,9 @@ function mapElementToString(
                 return false
             })
 
-            if (matchedImage) {
+            if (imageUrl) {
+                filteredBuffer.push(`<sticker>${imageUrl}</sticker>`)
+            } else if (matchedImage) {
                 filteredBuffer.push(matchedImage.formatted)
                 usedImages.add(matchedImage.formatted)
             } else if (images && images.length > 0) {
@@ -577,8 +579,6 @@ function mapElementToString(
                         usedImages.add(image.formatted)
                     }
                 }
-            } else if (imageUrl) {
-                filteredBuffer.push(`<sticker>${imageUrl}</sticker>`)
             } else {
                 let buffer = `[image`
                 if (imageHash) {
@@ -594,6 +594,14 @@ function mapElementToString(
             filteredBuffer.push(
                 `<face name='${element.attrs.name}'>${element.attrs.id}</face>`
             )
+        } else if (element.type === 'file') {
+            const url = element.attrs['chatluna_file_url']
+            if (!url) {
+                continue
+            }
+            const name = element.attrs['file'] ?? element.attrs['name']
+
+            filteredBuffer.push(`[file:${name}:${url}]`)
         }
     }
 
